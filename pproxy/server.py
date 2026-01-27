@@ -192,6 +192,7 @@ CONNECTION_POOL = ConnectionPool()
 
 class UDPProtocol(asyncio.DatagramProtocol):
     """Module-level UDP protocol class to avoid repeated class definition overhead."""
+    __slots__ = ('proxy', 'addr', 'reply_fn', 'databuf', 'transport', 'update')
     def __init__(self, proxy, addr, data, reply_fn):
         self.proxy = proxy
         self.addr = addr
@@ -230,6 +231,7 @@ patch_StreamReader()
 patch_StreamWriter()
 
 class AuthTable(object):
+    __slots__ = ('remote_ip', 'authtime')
     _auth = OrderedDict()  # {remote_ip: (timestamp, user)}
     MAX_ENTRIES = 10000  # Prevent unbounded memory growth
     def __init__(self, remote_ip, authtime):

@@ -1,5 +1,37 @@
 import os, hashlib, hmac
 
+# Lazy cipher module cache - avoids repeated imports on each connection
+_CIPHER_MODULES = {}
+
+def _get_cipher(name):
+    """Get cipher module from cache or import it."""
+    if name not in _CIPHER_MODULES:
+        if name == 'ARC4':
+            from Crypto.Cipher import ARC4
+            _CIPHER_MODULES[name] = ARC4
+        elif name == 'ChaCha20':
+            from Crypto.Cipher import ChaCha20
+            _CIPHER_MODULES[name] = ChaCha20
+        elif name == 'Salsa20':
+            from Crypto.Cipher import Salsa20
+            _CIPHER_MODULES[name] = Salsa20
+        elif name == 'AES':
+            from Crypto.Cipher import AES
+            _CIPHER_MODULES[name] = AES
+        elif name == 'ChaCha20_Poly1305':
+            from Crypto.Cipher import ChaCha20_Poly1305
+            _CIPHER_MODULES[name] = ChaCha20_Poly1305
+        elif name == 'Blowfish':
+            from Crypto.Cipher import Blowfish
+            _CIPHER_MODULES[name] = Blowfish
+        elif name == 'CAST':
+            from Crypto.Cipher import CAST
+            _CIPHER_MODULES[name] = CAST
+        elif name == 'DES':
+            from Crypto.Cipher import DES
+            _CIPHER_MODULES[name] = DES
+    return _CIPHER_MODULES[name]
+
 class BaseCipher(object):
     PYTHON = False
     CACHE = {}
@@ -95,8 +127,7 @@ class RC4_Cipher(BaseCipher):
     KEY_LENGTH = 16
     IV_LENGTH = 0
     def setup(self):
-        from Crypto.Cipher import ARC4
-        self.cipher = ARC4.new(self.key)
+        self.cipher = _get_cipher('ARC4').new(self.key)
 
 class RC4_MD5_Cipher(RC4_Cipher):
     IV_LENGTH = 16
@@ -108,8 +139,7 @@ class ChaCha20_Cipher(BaseCipher):
     KEY_LENGTH = 32
     IV_LENGTH = 8
     def setup(self):
-        from Crypto.Cipher import ChaCha20
-        self.cipher = ChaCha20.new(key=self.key, nonce=self.iv)
+        self.cipher = _get_cipher('ChaCha20').new(key=self.key, nonce=self.iv)
 class ChaCha20_IETF_Cipher(ChaCha20_Cipher):
     IV_LENGTH = 12
 
@@ -117,15 +147,14 @@ class Salsa20_Cipher(BaseCipher):
     KEY_LENGTH = 32
     IV_LENGTH = 8
     def setup(self):
-        from Crypto.Cipher import Salsa20
-        self.cipher = Salsa20.new(key=self.key, nonce=self.iv)
+        self.cipher = _get_cipher('Salsa20').new(key=self.key, nonce=self.iv)
 
 class AES_256_CFB_Cipher(BaseCipher):
     KEY_LENGTH = 32
     IV_LENGTH = 16
     SEGMENT_SIZE = 128
     def setup(self):
-        from Crypto.Cipher import AES
+        AES = _get_cipher('AES')
         self.cipher = AES.new(self.key, AES.MODE_CFB, iv=self.iv, segment_size=self.SEGMENT_SIZE)
 class AES_128_CFB_Cipher(AES_256_CFB_Cipher):
     KEY_LENGTH = 16
@@ -143,7 +172,7 @@ class AES_256_OFB_Cipher(BaseCipher):
     KEY_LENGTH = 32
     IV_LENGTH = 16
     def setup(self):
-        from Crypto.Cipher import AES
+        AES = _get_cipher('AES')
         self.cipher = AES.new(self.key, AES.MODE_OFB, iv=self.iv)
 class AES_192_OFB_Cipher(AES_256_OFB_Cipher):
     KEY_LENGTH = 24
@@ -154,7 +183,7 @@ class AES_256_CTR_Cipher(BaseCipher):
     KEY_LENGTH = 32
     IV_LENGTH = 16
     def setup(self):
-        from Crypto.Cipher import AES
+        AES = _get_cipher('AES')
         self.cipher = AES.new(self.key, AES.MODE_CTR, nonce=b'', initial_value=self.iv)
 class AES_192_CTR_Cipher(AES_256_CTR_Cipher):
     KEY_LENGTH = 24
@@ -171,8 +200,8 @@ class AES_256_GCM_Cipher(AEADCipher):
     def encrypt_and_digest(self, buffer):
         return self.cipher_new(self.nonce).encrypt_and_digest(buffer)
     def setup(self):
-        from Crypto.Cipher import AES
-        self.cipher_new = lambda nonce: AES.new(self.key, AES.MODE_GCM, nonce=nonce, mac_len=self.TAG_LENGTH)
+        AES = _get_cipher('AES')
+        self.cipher_new = lambda nonce, AES=AES: AES.new(self.key, AES.MODE_GCM, nonce=nonce, mac_len=self.TAG_LENGTH)
 class AES_192_GCM_Cipher(AES_256_GCM_Cipher):
     KEY_LENGTH = IV_LENGTH = 24
 class AES_128_GCM_Cipher(AES_256_GCM_Cipher):
@@ -188,28 +217,28 @@ class ChaCha20_IETF_POLY1305_Cipher(AEADCipher):
     def encrypt_and_digest(self, buffer):
         return self.cipher_new(self.nonce).encrypt_and_digest(buffer)
     def setup(self):
-        from Crypto.Cipher import ChaCha20_Poly1305
-        self.cipher_new = lambda nonce: ChaCha20_Poly1305.new(key=self.key, nonce=nonce)
+        ChaCha20_Poly1305 = _get_cipher('ChaCha20_Poly1305')
+        self.cipher_new = lambda nonce, C=ChaCha20_Poly1305: C.new(key=self.key, nonce=nonce)
 
 class BF_CFB_Cipher(BaseCipher):
     KEY_LENGTH = 16
     IV_LENGTH = 8
     def setup(self):
-        from Crypto.Cipher import Blowfish
+        Blowfish = _get_cipher('Blowfish')
         self.cipher = Blowfish.new(self.key, Blowfish.MODE_CFB, iv=self.iv, segment_size=64)
 
 class CAST5_CFB_Cipher(BaseCipher):
     KEY_LENGTH = 16
     IV_LENGTH = 8
     def setup(self):
-        from Crypto.Cipher import CAST
+        CAST = _get_cipher('CAST')
         self.cipher = CAST.new(self.key, CAST.MODE_CFB, iv=self.iv, segment_size=64)
 
 class DES_CFB_Cipher(BaseCipher):
     KEY_LENGTH = 8
     IV_LENGTH = 8
     def setup(self):
-        from Crypto.Cipher import DES
+        DES = _get_cipher('DES')
         self.cipher = DES.new(self.key, DES.MODE_CFB, iv=self.iv, segment_size=64)
 
 class PacketCipher:
