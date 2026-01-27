@@ -118,26 +118,31 @@ class SSR(BaseProtocol):
 
 class SS(SSR):
     def patch_ota_reader(self, cipher, reader):
-        chunk_id, data_len, _buffer = 0, None, bytearray()
+        chunk_id, data_len, _buffer, _offset = 0, None, bytearray(), 0
         def decrypt(s):
-            nonlocal chunk_id, data_len
+            nonlocal chunk_id, data_len, _offset
             _buffer.extend(s)
             ret = bytearray()
+            buf_len = len(_buffer)
             while 1:
                 if data_len is None:
-                    if len(_buffer) < 2:
+                    if buf_len - _offset < 2:
                         break
-                    data_len = int.from_bytes(_buffer[:2], 'big')
-                    del _buffer[:2]
+                    data_len = int.from_bytes(_buffer[_offset:_offset+2], 'big')
+                    _offset += 2
                 else:
-                    if len(_buffer) < 10+data_len:
+                    if buf_len - _offset < 10+data_len:
                         break
-                    data = _buffer[10:10+data_len]
-                    assert _buffer[:10] == hmac.new(cipher.iv+chunk_id.to_bytes(4, 'big'), data, hashlib.sha1).digest()[:10]
-                    del _buffer[:10+data_len]
+                    data = _buffer[_offset+10:_offset+10+data_len]
+                    assert _buffer[_offset:_offset+10] == hmac.new(cipher.iv+chunk_id.to_bytes(4, 'big'), data, hashlib.sha1).digest()[:10]
+                    _offset += 10+data_len
                     data_len = None
                     chunk_id += 1
                     ret.extend(data)
+            # Compact buffer only once after processing
+            if _offset > 0:
+                del _buffer[:_offset]
+                _offset = 0
             return bytes(ret)
         reader.decrypts.append(decrypt)
         if reader._buffer:
