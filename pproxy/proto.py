@@ -2,7 +2,190 @@ import asyncio, socket, urllib.parse, time, re, base64, hmac, struct, hashlib, i
 from . import admin
 HTTP_LINE = re.compile('([^ ]+) +(.+?) +(HTTP/[^ ]+)$')
 HTTP_LINE_BYTES = re.compile(rb'^([^ ]+) +(.+?) +(HTTP/[^ ]+)\r\n')  # Bytes version for fast matching
+HTTP_RESPONSE_LINE = re.compile(rb'^HTTP/(\d\.\d) (\d+)')
+CONTENT_LENGTH_RE = re.compile(rb'\r\nContent-Length:\s*(\d+)\r\n', re.IGNORECASE)
+TRANSFER_ENCODING_RE = re.compile(rb'\r\nTransfer-Encoding:\s*chunked\r\n', re.IGNORECASE)
+CONNECTION_RE = re.compile(rb'\r\nConnection:\s*([\w-]+)\r\n', re.IGNORECASE)
 packstr = lambda s, n=1: len(s).to_bytes(n, 'big') + s
+
+
+class HTTPResponseTracker:
+    """
+    Tracks HTTP response state to detect when a response is complete.
+    Supports Content-Length, chunked transfer encoding, and connection close.
+    """
+    __slots__ = ('state', 'content_length', 'body_received', 'chunked', 'chunk_remaining',
+                 'keep_alive', 'http_version', 'status_code', 'header_buffer')
+
+    # States
+    READING_HEADERS = 0
+    READING_BODY = 1
+    READING_CHUNK_SIZE = 2
+    READING_CHUNK_DATA = 3
+    READING_CHUNK_TRAILER = 4
+    COMPLETE = 5
+
+    def __init__(self):
+        self.state = self.READING_HEADERS
+        self.content_length = None
+        self.body_received = 0
+        self.chunked = False
+        self.chunk_remaining = 0
+        self.keep_alive = True  # Default for HTTP/1.1
+        self.http_version = b'1.1'
+        self.status_code = 0
+        self.header_buffer = bytearray()
+
+    def feed(self, data):
+        """
+        Feed data to tracker. Returns (data_to_forward, is_complete).
+        """
+        if self.state == self.COMPLETE:
+            return b'', True
+
+        if self.state == self.READING_HEADERS:
+            self.header_buffer.extend(data)
+            header_end = self.header_buffer.find(b'\r\n\r\n')
+            if header_end == -1:
+                return bytes(self.header_buffer), False
+
+            # Parse headers
+            headers = bytes(self.header_buffer[:header_end + 4])
+            remaining = bytes(self.header_buffer[header_end + 4:])
+            self.header_buffer.clear()
+
+            # Extract HTTP version and status
+            match = HTTP_RESPONSE_LINE.match(headers)
+            if match:
+                self.http_version = match.group(1)
+                self.status_code = int(match.group(2))
+
+            # Check for Content-Length
+            cl_match = CONTENT_LENGTH_RE.search(headers)
+            if cl_match:
+                self.content_length = int(cl_match.group(1))
+
+            # Check for chunked encoding
+            if TRANSFER_ENCODING_RE.search(headers):
+                self.chunked = True
+
+            # Check Connection header
+            conn_match = CONNECTION_RE.search(headers)
+            if conn_match:
+                conn_value = conn_match.group(1).lower()
+                self.keep_alive = conn_value != b'close'
+            else:
+                # HTTP/1.0 default is close, HTTP/1.1 default is keep-alive
+                self.keep_alive = self.http_version != b'1.0'
+
+            # Determine next state
+            # 1xx, 204, 304 have no body
+            if self.status_code < 200 or self.status_code in (204, 304):
+                self.state = self.COMPLETE
+                return headers + remaining, True
+            elif self.chunked:
+                self.state = self.READING_CHUNK_SIZE
+                body_data, is_complete = self._process_chunked(remaining)
+                return headers + body_data, is_complete
+            elif self.content_length is not None:
+                self.state = self.READING_BODY
+                body_data, is_complete = self._process_body(remaining)
+                return headers + body_data, is_complete
+            else:
+                # No Content-Length and not chunked - read until close
+                self.keep_alive = False
+                self.state = self.READING_BODY
+                return headers + remaining, False
+
+        elif self.state == self.READING_BODY:
+            return self._process_body(data)
+
+        elif self.state in (self.READING_CHUNK_SIZE, self.READING_CHUNK_DATA, self.READING_CHUNK_TRAILER):
+            return self._process_chunked(data)
+
+        return data, False
+
+    def _process_body(self, data):
+        """Process body with Content-Length."""
+        self.body_received += len(data)
+        if self.content_length is not None and self.body_received >= self.content_length:
+            self.state = self.COMPLETE
+            return data, True
+        return data, False
+
+    def _process_chunked(self, data):
+        """Process chunked transfer encoding."""
+        result = bytearray()
+        pos = 0
+        data_len = len(data)
+
+        while pos < data_len:
+            if self.state == self.READING_CHUNK_SIZE:
+                # Look for chunk size line
+                line_end = data.find(b'\r\n', pos)
+                if line_end == -1:
+                    result.extend(data[pos:])
+                    break
+
+                chunk_line = data[pos:line_end]
+                # Parse hex chunk size (ignore extensions after ;)
+                size_str = chunk_line.split(b';')[0].strip()
+                try:
+                    self.chunk_remaining = int(size_str, 16)
+                except ValueError:
+                    self.chunk_remaining = 0
+
+                result.extend(data[pos:line_end + 2])
+                pos = line_end + 2
+
+                if self.chunk_remaining == 0:
+                    self.state = self.READING_CHUNK_TRAILER
+                else:
+                    self.state = self.READING_CHUNK_DATA
+
+            elif self.state == self.READING_CHUNK_DATA:
+                available = data_len - pos
+                to_read = min(self.chunk_remaining, available)
+                result.extend(data[pos:pos + to_read])
+                pos += to_read
+                self.chunk_remaining -= to_read
+
+                if self.chunk_remaining == 0:
+                    # Need to read trailing \r\n
+                    if pos + 2 <= data_len:
+                        result.extend(data[pos:pos + 2])
+                        pos += 2
+                        self.state = self.READING_CHUNK_SIZE
+                    else:
+                        # Partial \r\n
+                        result.extend(data[pos:])
+                        break
+
+            elif self.state == self.READING_CHUNK_TRAILER:
+                # After final 0-size chunk, look for empty line or trailer headers
+                line_end = data.find(b'\r\n', pos)
+                if line_end == -1:
+                    result.extend(data[pos:])
+                    break
+
+                if line_end == pos:
+                    # Empty line - end of response
+                    result.extend(b'\r\n')
+                    self.state = self.COMPLETE
+                    return bytes(result), True
+                else:
+                    # Trailer header - skip it
+                    result.extend(data[pos:line_end + 2])
+                    pos = line_end + 2
+
+        return bytes(result), self.state == self.COMPLETE
+
+    def is_complete(self):
+        return self.state == self.COMPLETE
+
+    def can_reuse(self):
+        """Returns True if connection can be reused after this response."""
+        return self.state == self.COMPLETE and self.keep_alive
 
 def netloc_split(loc, default_host=None, default_port=None):
     ipv6 = re.fullmatch(r'\[([0-9a-fA-F:]*)\](?::(\d+)?)?', loc)

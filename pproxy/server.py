@@ -296,6 +296,141 @@ def schedule(rserver, salgorithm, host_name, port):
     else:
         raise Exception('Unknown scheduling algorithm') #Unreachable
 
+
+async def http_keepalive_proxy(reader, writer, reader_remote, writer_remote,
+                                host, port, lproto, modstat_fn, connection_change):
+    """
+    HTTP proxy with keep-alive connection pooling.
+    Handles bidirectional data flow and returns connections to pool when reusable.
+    """
+    stat_bytes_to_remote = modstat_fn(0)  # client -> remote stats
+    stat_bytes_from_remote = modstat_fn(2)  # remote -> client stats
+    stat_conn_to_remote = modstat_fn(1)
+    stat_conn_from_remote = modstat_fn(3)
+    connection_change(1)
+    stat_conn_to_remote(1)
+    stat_conn_from_remote(1)
+
+    response_tracker = proto.HTTPResponseTracker()
+    can_pool = True
+    last_response_complete = False  # Track if last response was complete
+
+    async def forward_to_remote():
+        """Forward requests from client to remote."""
+        nonlocal can_pool
+        pending_bytes = 0
+        try:
+            while not reader.at_eof() and not writer_remote.is_closing():
+                data = await reader.read(65536)
+                if not data:
+                    break
+                # Rewrite HTTP requests (strip Proxy- headers, fix path)
+                if len(data) >= 4 and data[:4] in lproto.HTTP_METHOD_PREFIXES:
+                    match = proto.HTTP_LINE_BYTES.match(data)
+                    if match:
+                        if b'\r\n\r\n' not in data:
+                            try:
+                                data += await reader.readuntil(b'\r\n\r\n')
+                            except asyncio.IncompleteReadError:
+                                break
+                        lines, body = data.split(b'\r\n\r\n', 1)
+                        headers = lines.decode().split('\r\n')
+                        method, path, ver = proto.HTTP_LINE.match(headers.pop(0)).groups()
+                        # Remove Proxy- headers
+                        headers = [h for h in headers if not h.startswith('Proxy-')]
+                        newpath = urllib.parse.urlparse(path)._replace(netloc='', scheme='').geturl()
+                        data = f'{method} {newpath} {ver}\r\n' + '\r\n'.join(headers) + '\r\n\r\n'
+                        data = data.encode() + body
+
+                stat_bytes_to_remote(len(data))
+                writer_remote.write(data)
+                pending_bytes += len(data)
+                if pending_bytes >= 65536:
+                    await writer_remote.drain()
+                    pending_bytes = 0
+            if pending_bytes > 0:
+                await writer_remote.drain()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            can_pool = False
+
+    async def forward_from_remote():
+        """Forward responses from remote to client, tracking completion."""
+        nonlocal can_pool, response_tracker, last_response_complete
+        try:
+            while not reader_remote.at_eof() and not writer.is_closing():
+                data = await reader_remote.read(65536)
+                if not data:
+                    break
+
+                # Feed data to tracker to detect response completion
+                data, is_complete = response_tracker.feed(data)
+                if data:
+                    stat_bytes_from_remote(len(data))
+                    writer.write(data)
+                    await writer.drain()
+
+                if is_complete:
+                    # Response complete - mark it
+                    last_response_complete = True
+                    # Check if we can keep the connection
+                    if not response_tracker.can_reuse():
+                        can_pool = False
+                    # Reset tracker for next response
+                    response_tracker = proto.HTTPResponseTracker()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            can_pool = False
+
+    task_to_remote = asyncio.create_task(forward_to_remote())
+    task_from_remote = asyncio.create_task(forward_from_remote())
+
+    try:
+        # Wait for either task to complete (client disconnect or remote disconnect)
+        done, pending = await asyncio.wait(
+            [task_to_remote, task_from_remote],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        # Cancel remaining tasks
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    except Exception:
+        can_pool = False
+        task_to_remote.cancel()
+        task_from_remote.cancel()
+    finally:
+        stat_conn_to_remote(-1)
+        stat_conn_from_remote(-1)
+        connection_change(-1)
+
+        # Close client connection
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+        # Try to return remote connection to pool
+        if can_pool and last_response_complete:
+            # Check if remote connection is still healthy
+            if not writer_remote.is_closing() and not reader_remote.at_eof():
+                pooled = await CONNECTION_POOL.put(host, port, reader_remote, writer_remote)
+                if pooled:
+                    CONNECTION_POOL._stats['reused'] += 1
+                    return  # Connection is in pool, don't close
+
+        # Close remote connection if not pooled
+        try:
+            writer_remote.close()
+        except Exception:
+            pass
+
+
 async def stream_handler(reader, writer, unix, lbind, protos, rserver, cipher, sslserver, debug=0, authtime=86400*30, block=None, salgorithm='fa', verbose=DUMMY, modstat=lambda u,r,h:lambda i:DUMMY, **kwargs):
     try:
         reader, writer = proto.sslwrap(reader, writer, sslserver, True, None, verbose)
@@ -329,9 +464,16 @@ async def stream_handler(reader, writer, unix, lbind, protos, rserver, cipher, s
                 writer_remote.close()
                 raise Exception('Unknown remote protocol')
             m = modstat(user, remote_ip, host_name)
-            lchannel = lproto.http_channel if use_http else lproto.channel
-            asyncio.ensure_future(lproto.channel(reader_remote, writer, m(2+roption.direct), m(4+roption.direct)))
-            asyncio.ensure_future(lchannel(reader, writer_remote, m(roption.direct), roption.connection_change))
+            # Use keep-alive proxying for direct HTTP connections
+            if use_http and roption.direct:
+                asyncio.ensure_future(http_keepalive_proxy(
+                    reader, writer, reader_remote, writer_remote,
+                    host_name, port, lproto, m, roption.connection_change
+                ))
+            else:
+                lchannel = lproto.http_channel if use_http else lproto.channel
+                asyncio.ensure_future(lproto.channel(reader_remote, writer, m(2+roption.direct), m(4+roption.direct)))
+                asyncio.ensure_future(lchannel(reader, writer_remote, m(roption.direct), roption.connection_change))
     except Exception as ex:
         if not isinstance(ex, asyncio.TimeoutError) and not str(ex).startswith('Connection closed'):
             verbose(f'{str(ex) or "Unsupported protocol"} from {remote_ip}')
@@ -1204,7 +1346,7 @@ def main(args = None):
         loop = uvloop.new_event_loop()
         asyncio.set_event_loop(loop)
         print('Using uvloop (faster event loop)')
-    except ModuleNotFoundError:
+    except (ModuleNotFoundError, PermissionError, OSError):
         print('Tip: Install uvloop for 2-3x faster connection handling: pip install uvloop')
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
