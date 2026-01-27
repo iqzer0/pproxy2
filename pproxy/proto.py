@@ -56,6 +56,7 @@ class BaseProtocol:
     async def channel(self, reader, writer, stat_bytes, stat_conn):
         try:
             stat_conn(1)
+            pending_bytes = 0
             while not reader.at_eof() and not writer.is_closing():
                 data = await reader.read(65536)
                 if not data:
@@ -64,6 +65,13 @@ class BaseProtocol:
                     continue
                 stat_bytes(len(data))
                 writer.write(data)
+                pending_bytes += len(data)
+                # Batch drain: only flush when buffer is large enough
+                if pending_bytes >= 65536:
+                    await writer.drain()
+                    pending_bytes = 0
+            # Final drain for any remaining data
+            if pending_bytes > 0:
                 await writer.drain()
         except Exception:
             pass
@@ -331,25 +339,38 @@ class HTTP(BaseProtocol):
     async def connect(self, reader_remote, writer_remote, rauth, host_name, port, **kw):
         writer_remote.write(f'CONNECT {host_name}:{port} HTTP/1.1\r\nHost: {host_name}:{port}'.encode() + (b'\r\nProxy-Authorization: Basic '+base64.b64encode(rauth) if rauth else b'') + b'\r\n\r\n')
         await reader_remote.read_until(b'\r\n\r\n')
+    # HTTP method prefixes for fast pre-check (avoid regex on non-HTTP data)
+    HTTP_METHOD_PREFIXES = (b'GET ', b'HEAD', b'POST', b'PUT ', b'DELE', b'CONN', b'OPTI', b'TRAC', b'PATC')
+
     async def http_channel(self, reader, writer, stat_bytes, stat_conn):
         try:
             stat_conn(1)
+            pending_bytes = 0
             while not reader.at_eof() and not writer.is_closing():
                 data = await reader.read(65536)
                 if not data:
                     break
-                if b'\r\n' in data and HTTP_LINE.match(data.split(b'\r\n', 1)[0].decode()):
-                    if b'\r\n\r\n' not in data:
-                        data += await reader.readuntil(b'\r\n\r\n')
-                    lines, data = data.split(b'\r\n\r\n', 1)
-                    headers = lines.decode().split('\r\n')
-                    method, path, ver = HTTP_LINE.match(headers.pop(0)).groups()
-                    lines = '\r\n'.join(i for i in headers if not i.startswith('Proxy-'))
-                    headers = dict(i.split(': ', 1) for i in headers if ': ' in i)
-                    newpath = urllib.parse.urlparse(path)._replace(netloc='', scheme='').geturl()
-                    data = f'{method} {newpath} {ver}\r\n{lines}\r\n\r\n'.encode() + data
+                # Fast pre-check: only do regex if data starts with HTTP method
+                if len(data) >= 4 and data[:4] in self.HTTP_METHOD_PREFIXES and b'\r\n' in data:
+                    if HTTP_LINE.match(data.split(b'\r\n', 1)[0].decode()):
+                        if b'\r\n\r\n' not in data:
+                            data += await reader.readuntil(b'\r\n\r\n')
+                        lines, data = data.split(b'\r\n\r\n', 1)
+                        headers = lines.decode().split('\r\n')
+                        method, path, ver = HTTP_LINE.match(headers.pop(0)).groups()
+                        lines = '\r\n'.join(i for i in headers if not i.startswith('Proxy-'))
+                        headers = dict(i.split(': ', 1) for i in headers if ': ' in i)
+                        newpath = urllib.parse.urlparse(path)._replace(netloc='', scheme='').geturl()
+                        data = f'{method} {newpath} {ver}\r\n{lines}\r\n\r\n'.encode() + data
                 stat_bytes(len(data))
                 writer.write(data)
+                pending_bytes += len(data)
+                # Batch drain: only flush when buffer is large enough
+                if pending_bytes >= 65536:
+                    await writer.drain()
+                    pending_bytes = 0
+            # Final drain for any remaining data
+            if pending_bytes > 0:
                 await writer.drain()
         except Exception:
             pass
@@ -495,6 +516,26 @@ class Tunnel(Transparent):
     def udp_connect(self, rauth, host_name, port, data, **kw):
         return data
 
+def _xor_mask(data, mask_key):
+    """Optimized XOR masking using 8-byte chunks for better performance."""
+    data_len = len(data)
+    if data_len == 0:
+        return bytes(data)
+    # Process 8 bytes at a time using int operations (mask_key repeated twice = 8 bytes)
+    mask_int = int.from_bytes(mask_key * 2, 'little')
+    result = bytearray(data_len)
+    i = 0
+    # Process 8-byte chunks
+    while i + 8 <= data_len:
+        chunk = int.from_bytes(data[i:i+8], 'little')
+        result[i:i+8] = (chunk ^ mask_int).to_bytes(8, 'little')
+        i += 8
+    # Handle remaining bytes (0-7)
+    while i < data_len:
+        result[i] = data[i] ^ mask_key[i & 3]
+        i += 1
+    return bytes(result)
+
 class WS(BaseProtocol):
     async def guess(self, reader, **kw):
         header = await reader.read_w(4)
@@ -515,14 +556,16 @@ class WS(BaseProtocol):
                     if len(_buffer) < required:
                         break
                     data_len = int.from_bytes(_buffer[2:4], 'big') if p == 126 else int.from_bytes(_buffer[2:6], 'big') if p == 127 else p
-                    mask_key = _buffer[required-4:required] if _buffer[1]&128 else None
+                    mask_key = bytes(_buffer[required-4:required]) if _buffer[1]&128 else None
                     del _buffer[:required]
                 else:
                     if len(_buffer) < data_len:
                         break
                     data = _buffer[:data_len]
                     if mask_key:
-                        data = bytes(data[i]^mask_key[i%4] for i in range(data_len))
+                        data = _xor_mask(data, mask_key)
+                    else:
+                        data = bytes(data)
                     del _buffer[:data_len]
                     data_len = None
                     o(data)
@@ -535,7 +578,7 @@ class WS(BaseProtocol):
             data_len = len(data)
             if masked:
                 mask_key = os.urandom(4)
-                data = bytes(data[i]^mask_key[i%4] for i in range(data_len))
+                data = _xor_mask(data, mask_key)
                 return o(b'\x02' + (bytes([data_len|0x80]) if data_len < 126 else b'\xfe'+data_len.to_bytes(2, 'big') if data_len < 65536 else b'\xff'+data_len.to_bytes(4, 'big')) + mask_key + data)
             else:
                 return o(b'\x02' + (bytes([data_len]) if data_len < 126 else b'\x7e'+data_len.to_bytes(2, 'big') if data_len < 65536 else b'\x7f'+data_len.to_bytes(4, 'big')) + data)

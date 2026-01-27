@@ -51,11 +51,32 @@ def setup(loop, args):
         sys.stdout.flush()
     args.verbose = verbose
     args.stats = {0: [0]*6}
+    # Cache for modstat results to avoid repeated dict lookups and lambda creation
+    _modstat_cache = {}
     def modstat(user, remote_ip, host_name, stats=args.stats):
+        # Create cache key
+        cache_key = (id(user) if isinstance(user, (bytes, bytearray)) else user, remote_ip, host_name)
+        cached = _modstat_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         u = user.decode().split(':')[0]+':' if isinstance(user, (bytes,bytearray)) else ''
         host_name_2 = '.'.join(host_name.split('.')[-3 if host_name.endswith('.com.cn') else -2:]) if host_name.split('.')[-1].isalpha() else host_name
         tostat = (stats[0], stats.setdefault(u+remote_ip, {}).setdefault(host_name_2, [0]*6))
-        return lambda i: lambda s: [st.__setitem__(i, st[i] + s) for st in tostat]
+
+        # Pre-create stat update functions for each index
+        def make_stat_fn(idx, st=tostat):
+            def stat_fn(s):
+                st[0][idx] += s
+                st[1][idx] += s
+            return stat_fn
+        stat_fns = {i: make_stat_fn(i) for i in range(6)}
+        result = lambda i, fns=stat_fns: fns.get(i, lambda s: None)
+
+        # Cache with size limit to prevent unbounded growth
+        if len(_modstat_cache) < 10000:
+            _modstat_cache[cache_key] = result
+        return result
     args.modstat = modstat
     def win_readline(handler):
         while True:

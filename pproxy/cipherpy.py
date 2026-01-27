@@ -28,12 +28,22 @@ class StreamCipher(BaseCipher):
     PYTHON = True
     def setup(self):
         self.stream = self.core()
+        self._keystream_cache = bytearray()
     def encrypt(self, s):
-        ret = bytearray()
-        for i in s:
-            ret.append(i^next(self.stream))
-        return bytes(ret)
-        #return bytes(i^next(self.stream) for i in s)
+        s_len = len(s)
+        if s_len == 0:
+            return b''
+        # Extend keystream cache if needed
+        cache_len = len(self._keystream_cache)
+        if cache_len < s_len:
+            # Generate in 4KB blocks for efficiency
+            needed = max(s_len - cache_len, 4096)
+            self._keystream_cache.extend(next(self.stream) for _ in range(needed))
+        # XOR with cached keystream
+        result = bytes(a ^ b for a, b in zip(s, self._keystream_cache[:s_len]))
+        # Remove used keystream
+        del self._keystream_cache[:s_len]
+        return result
     decrypt = encrypt
 
 class RC4_Cipher(StreamCipher):

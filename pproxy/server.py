@@ -1,4 +1,5 @@
 import argparse, time, re, asyncio, functools, base64, random, urllib.parse, socket, sys
+from collections import OrderedDict, deque
 from . import proto
 from . import admin
 
@@ -7,6 +8,179 @@ from .__doc__ import *
 SOCKET_TIMEOUT = 60
 UDP_LIMIT = 30
 DUMMY = lambda s: s
+
+# Connection Pool for reusing TCP connections
+class ConnectionPool:
+    """
+    Async connection pool for reusing TCP connections.
+    Pools connections by (host, port) key to avoid TCP handshake overhead.
+    """
+    def __init__(self, max_per_host=5, max_idle_time=30, max_total=100):
+        self._pools = {}  # (host, port) -> deque of (reader, writer, timestamp)
+        self._max_per_host = max_per_host
+        self._max_idle_time = max_idle_time
+        self._max_total = max_total
+        self._total_count = 0
+        self._lock = asyncio.Lock()
+        self._cleanup_task = None
+        self._stats = {'hits': 0, 'misses': 0, 'created': 0, 'reused': 0}
+
+    def _start_cleanup(self):
+        """Start background cleanup task if not running."""
+        if self._cleanup_task is None or self._cleanup_task.done():
+            try:
+                loop = asyncio.get_event_loop()
+                self._cleanup_task = loop.create_task(self._cleanup_loop())
+            except RuntimeError:
+                pass  # No event loop
+
+    async def _cleanup_loop(self):
+        """Periodically clean up stale connections."""
+        while True:
+            await asyncio.sleep(self._max_idle_time / 2)
+            await self._cleanup_stale()
+
+    async def _cleanup_stale(self):
+        """Remove connections that have been idle too long."""
+        now = time.monotonic()
+        async with self._lock:
+            for key in list(self._pools.keys()):
+                pool = self._pools[key]
+                # Remove stale connections from the front (oldest)
+                while pool:
+                    reader, writer, timestamp = pool[0]
+                    if now - timestamp > self._max_idle_time:
+                        pool.popleft()
+                        self._total_count -= 1
+                        try:
+                            writer.close()
+                        except Exception:
+                            pass
+                    else:
+                        break
+                # Remove empty pools
+                if not pool:
+                    del self._pools[key]
+
+    async def get(self, host, port):
+        """
+        Get a connection from the pool.
+        Returns (reader, writer) if available, None otherwise.
+        """
+        key = (host, port)
+        async with self._lock:
+            pool = self._pools.get(key)
+            if not pool:
+                self._stats['misses'] += 1
+                return None
+
+            now = time.monotonic()
+            while pool:
+                reader, writer, timestamp = pool.popleft()
+                self._total_count -= 1
+
+                # Check if connection is still valid
+                if now - timestamp > self._max_idle_time:
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+                    continue
+
+                # Check if connection is closed
+                if writer.is_closing() or reader.at_eof():
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+                    continue
+
+                self._stats['hits'] += 1
+                self._stats['reused'] += 1
+                return reader, writer
+
+            self._stats['misses'] += 1
+            return None
+
+    async def put(self, host, port, reader, writer):
+        """
+        Return a connection to the pool for reuse.
+        Returns True if pooled, False if connection was closed instead.
+        """
+        # Don't pool closed connections
+        if writer.is_closing() or reader.at_eof():
+            try:
+                writer.close()
+            except Exception:
+                pass
+            return False
+
+        key = (host, port)
+        async with self._lock:
+            # Check total pool size
+            if self._total_count >= self._max_total:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+                return False
+
+            pool = self._pools.get(key)
+            if pool is None:
+                pool = self._pools[key] = deque()
+                self._start_cleanup()
+
+            # Check per-host limit
+            if len(pool) >= self._max_per_host:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+                return False
+
+            pool.append((reader, writer, time.monotonic()))
+            self._total_count += 1
+            return True
+
+    def stats(self):
+        """Return pool statistics."""
+        return {
+            **self._stats,
+            'pooled_connections': self._total_count,
+            'unique_destinations': len(self._pools)
+        }
+
+# Global connection pool
+CONNECTION_POOL = ConnectionPool()
+
+class UDPProtocol(asyncio.DatagramProtocol):
+    """Module-level UDP protocol class to avoid repeated class definition overhead."""
+    def __init__(self, proxy, addr, data, reply_fn):
+        self.proxy = proxy
+        self.addr = addr
+        self.reply_fn = reply_fn
+        proxy.udpmap[addr] = self
+        self.databuf = [data]
+        self.transport = None
+        self.update = 0
+    def connection_made(self, transport):
+        self.transport = transport
+        for data in self.databuf:
+            transport.sendto(data)
+        self.databuf.clear()
+        self.update = time.perf_counter()
+    def new_data_arrived(self, data):
+        if self.transport:
+            self.transport.sendto(data)
+        else:
+            self.databuf.append(data)
+        self.update = time.perf_counter()
+    def datagram_received(self, data, addr):
+        data = self.proxy.udp_packet_unpack(data)
+        self.reply_fn(data)
+        self.update = time.perf_counter()
+    def connection_lost(self, exc):
+        self.proxy.udpmap.pop(self.addr, None)
 
 def patch_StreamReader(c=asyncio.StreamReader):
     c.read_w = lambda self, n: asyncio.wait_for(self.read(n), timeout=SOCKET_TIMEOUT)
@@ -19,17 +193,28 @@ patch_StreamReader()
 patch_StreamWriter()
 
 class AuthTable(object):
-    _auth = {}
-    _user = {}
+    _auth = OrderedDict()
+    _user = OrderedDict()
+    MAX_ENTRIES = 10000  # Prevent unbounded memory growth
     def __init__(self, remote_ip, authtime):
         self.remote_ip = remote_ip
         self.authtime = authtime
     def authed(self):
         if time.time() - self._auth.get(self.remote_ip, 0) <= self.authtime:
-            return self._user[self.remote_ip]
+            # Move to end (most recently used)
+            if self.remote_ip in self._auth:
+                self._auth.move_to_end(self.remote_ip)
+                self._user.move_to_end(self.remote_ip)
+            return self._user.get(self.remote_ip)
     def set_authed(self, user):
+        # Evict oldest entries if at capacity
+        while len(self._auth) >= self.MAX_ENTRIES:
+            self._auth.popitem(last=False)
+            self._user.popitem(last=False)
         self._auth[self.remote_ip] = time.time()
         self._user[self.remote_ip] = user
+        self._auth.move_to_end(self.remote_ip)
+        self._user.move_to_end(self.remote_ip)
 
 async def prepare_ciphers(cipher, reader, writer, bind=None, server_side=True):
     if cipher:
@@ -44,15 +229,25 @@ async def prepare_ciphers(cipher, reader, writer, bind=None, server_side=True):
     else:
         return None, None
 
+_rr_index = [0]  # Mutable container for round-robin state
+
 def schedule(rserver, salgorithm, host_name, port):
     filter_cond = lambda o: o.alive and o.match_rule(host_name, port)
     if salgorithm == 'fa':
         return next(filter(filter_cond, rserver), None)
     elif salgorithm == 'rr':
-        for i, roption in enumerate(rserver):
+        # O(1) index-based round-robin instead of O(n) list modification
+        n = len(rserver)
+        if n == 0:
+            return None
+        start = _rr_index[0] % n
+        for offset in range(n):
+            i = (start + offset) % n
+            roption = rserver[i]
             if filter_cond(roption):
-                rserver.append(rserver.pop(i))
+                _rr_index[0] = i + 1  # Next call starts from next server
                 return roption
+        return None
     elif salgorithm == 'rc':
         filters = [i for i in rserver if filter_cond(i)]
         return random.choice(filters) if filters else None
@@ -176,30 +371,6 @@ class ProxyDirect(object):
     def destination(self, host, port):
         return host, port
     async def udp_open_connection(self, host, port, data, addr, reply):
-        class Protocol(asyncio.DatagramProtocol):
-            def __init__(prot, data):
-                self.udpmap[addr] = prot
-                prot.databuf = [data]
-                prot.transport = None
-                prot.update = 0
-            def connection_made(prot, transport):
-                prot.transport = transport
-                for data in prot.databuf:
-                    transport.sendto(data)
-                prot.databuf.clear()
-                prot.update = time.perf_counter()
-            def new_data_arrived(prot, data):
-                if prot.transport:
-                    prot.transport.sendto(data)
-                else:
-                    prot.databuf.append(data)
-                prot.update = time.perf_counter()
-            def datagram_received(prot, data, addr):
-                data = self.udp_packet_unpack(data)
-                reply(data)
-                prot.update = time.perf_counter()
-            def connection_lost(prot, exc):
-                self.udpmap.pop(addr, None)
         if addr in self.udpmap:
             self.udpmap[addr].new_data_arrived(data)
         else:
@@ -209,20 +380,30 @@ class ProxyDirect(object):
                 prot = self.udpmap.pop(min_addr)
                 if prot.transport:
                     prot.transport.close()
-            prot = lambda: Protocol(data)
+            prot = lambda: UDPProtocol(self, addr, data, reply)
             remote = self.destination(host, port)
             await asyncio.get_event_loop().create_datagram_endpoint(prot, remote_addr=remote)
     def udp_prepare_connection(self, host, port, data):
         return data
     def wait_open_connection(self, host, port, local_addr, family):
         return asyncio.open_connection(host=host, port=port, local_addr=local_addr, family=family)
-    async def open_connection(self, host, port, local_addr, lbind, timeout=SOCKET_TIMEOUT):
+    async def open_connection(self, host, port, local_addr, lbind, timeout=SOCKET_TIMEOUT, use_pool=True):
+        # Try to get a pooled connection first (only for direct connections without local_addr binding)
+        if use_pool and host and port and self.direct and not local_addr and not lbind and not self.lbind:
+            pooled = await CONNECTION_POOL.get(host, port)
+            if pooled:
+                return pooled
         try:
             local_addr = local_addr if self.lbind == 'in' else (self.lbind, 0) if self.lbind else \
                          local_addr if lbind == 'in' else (lbind, 0) if lbind else None
             family = 0 if local_addr is None else socket.AF_INET6 if ':' in local_addr[0] else socket.AF_INET
             wait = self.wait_open_connection(host, port, local_addr, family)
             reader, writer = await asyncio.wait_for(wait, timeout=timeout)
+            # Enable TCP_NODELAY for lower latency (disable Nagle's algorithm)
+            sock = writer.get_extra_info('socket')
+            if sock:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            CONNECTION_POOL._stats['created'] += 1
         except Exception as ex:
             raise
         return reader, writer
@@ -912,6 +1093,7 @@ def main(args = None):
     parser.add_argument('--auth', dest='authtime', type=int, default=86400*30, help='re-auth time interval for same ip (default: 86400*30)')
     parser.add_argument('--sys', action='store_true', help='change system proxy setting (mac, windows)')
     parser.add_argument('--reuse', dest='ruport', action='store_true', help='set SO_REUSEPORT (Linux only)')
+    parser.add_argument('--workers', dest='workers', type=int, default=1, help='number of worker processes (requires --reuse, Linux only)')
     parser.add_argument('--daemon', dest='daemon', action='store_true', help='run as a daemon (Linux only)')
     parser.add_argument('--test', help='test this url for all remote proxies and exit')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
@@ -946,13 +1128,39 @@ def main(args = None):
         except ModuleNotFoundError:
             print("Missing library: pip3 install python-daemon")
             return
-    # Try to use uvloop instead of the default event loop
+    # Multi-process worker support (requires SO_REUSEPORT)
+    if args.workers > 1:
+        if sys.platform == 'win32':
+            print('Multi-process workers not supported on Windows')
+            return
+        # Auto-enable SO_REUSEPORT for multi-process
+        args.ruport = True
+        import os
+        worker_pids = []
+        for i in range(args.workers - 1):
+            pid = os.fork()
+            if pid == 0:
+                # Child process - continue to run proxy
+                print(f'Worker {i+1} started (PID: {os.getpid()})')
+                break
+            else:
+                # Parent process - track child
+                worker_pids.append(pid)
+        else:
+            # Parent process after forking all children
+            if worker_pids:
+                print(f'Master process (PID: {os.getpid()}) with {len(worker_pids)} workers')
+                # Parent also runs as a worker
+    # Try to use uvloop instead of the default event loop (2-3x faster for connections)
     try:
-        __import__('uvloop').install()
-        print('Using uvloop')
+        import uvloop
+        loop = uvloop.new_event_loop()
+        asyncio.set_event_loop(loop)
+        print('Using uvloop (faster event loop)')
     except ModuleNotFoundError:
-        pass
-    loop = asyncio.get_event_loop()
+        print('Tip: Install uvloop for 2-3x faster connection handling: pip install uvloop')
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
     if args.v:
         from . import verbose
         verbose.setup(loop, args)

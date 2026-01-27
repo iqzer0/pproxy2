@@ -212,27 +212,23 @@ class PacketCipher:
 
 MAP = {cls.name(): cls for name, cls in globals().items() if name.endswith('_Cipher')}
 
+# Verify pycryptodome is installed at module load time
+try:
+    import Crypto
+    if Crypto.version_info < (3, 4):
+        raise ImportError("pycryptodome version 3.4+ required")
+except ImportError as e:
+    raise ImportError(
+        "pycryptodome is required for encryption. Install with: pip3 install pycryptodome"
+    ) from e
+
 def get_cipher(cipher_key):
-    from .cipherpy import MAP as MAP_PY
     cipher, key = cipher_key.split(':')
     cipher_name, ota, _ = cipher.partition('!')
-    if cipher_name not in MAP and cipher_name not in MAP_PY and not (cipher_name.endswith('-py') and cipher_name[:-3] in MAP_PY):
-        return f'existing ciphers: {sorted(set(MAP)|set(MAP_PY))}', None
+    if cipher_name not in MAP:
+        return f'existing ciphers: {sorted(MAP.keys())}', None
     key, ota = key.encode(), bool(ota) if ota else False
-    cipher = MAP.get(cipher_name)
-    if cipher:
-        try:
-            assert __import__('Crypto').version_info >= (3, 4)
-        except Exception:
-            cipher = None
-    if cipher is None:
-        cipher = MAP_PY.get(cipher_name)
-        if cipher is None and cipher_name.endswith('-py'):
-            cipher_name = cipher_name[:-3]
-            cipher = MAP_PY.get(cipher_name)
-    if cipher is None:
-        return 'this cipher needs library: "pip3 install pycryptodome"', None
-    cipher_name += ('-py' if cipher.PYTHON else '')
+    cipher = MAP[cipher_name]
     def apply_cipher(reader, writer, pdecrypt, pdecrypt2, pencrypt, pencrypt2):
         reader_cipher, writer_cipher = cipher(key, ota=ota), cipher(key, ota=ota)
         reader_cipher._buffer = b''

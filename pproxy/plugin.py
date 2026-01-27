@@ -60,51 +60,62 @@ class Tls1__2_Ticket_Auth_Plugin(BasePlugin):
 
     def add_cipher(self, cipher):
         self.buf = bytearray()
+        self.buf_offset = 0
         def decrypt(s):
             self.buf.extend(s)
-            ret = b''
-            while len(self.buf) >= 5:
-                l = int.from_bytes(self.buf[3:5], 'big')
-                if len(self.buf) < l:
+            ret = bytearray()
+            while self.buf_offset + 5 <= len(self.buf):
+                l = int.from_bytes(self.buf[self.buf_offset+3:self.buf_offset+5], 'big')
+                if self.buf_offset + 5 + l > len(self.buf):
                     break
-                if self.buf[:3] in (b'\x16\x03\x03', b'\x14\x03\x03'):
-                    del self.buf[:5+l]
+                header = bytes(self.buf[self.buf_offset:self.buf_offset+3])
+                if header in (b'\x16\x03\x03', b'\x14\x03\x03'):
+                    self.buf_offset += 5 + l
                     continue
-                assert self.buf[:3] == b'\x17\x03\x03'
-                data = self.buf[5:5+l]
-                ret += data
-                del self.buf[:5+l]
-            return ret
+                assert header == b'\x17\x03\x03'
+                ret.extend(self.buf[self.buf_offset+5:self.buf_offset+5+l])
+                self.buf_offset += 5 + l
+            # Compact buffer only when offset is large to reduce reallocations
+            if self.buf_offset > 8192:
+                del self.buf[:self.buf_offset]
+                self.buf_offset = 0
+            return bytes(ret)
         def pack(s):
             return b'\x17\x03\x03' + packstr(s)
         def encrypt(s):
-            ret = b''
+            ret = bytearray()
             while len(s) > 2048:
                 size = min(random.randrange(4096)+100, len(s))
-                ret += pack(s[:size])
+                ret.extend(pack(s[:size]))
                 s = s[size:]
             if s:
-                ret += pack(s)
-            return ret
+                ret.extend(pack(s))
+            return bytes(ret)
         cipher.pdecrypt2 = decrypt
         cipher.pencrypt2 = encrypt
 
 class Verify_Simple_Plugin(BasePlugin):
     def add_cipher(self, cipher):
         self.buf = bytearray()
+        self.buf_offset = 0
         def decrypt(s):
             self.buf.extend(s)
-            ret = b''
-            while len(self.buf) >= 2:
-                l = int.from_bytes(self.buf[:2], 'big')
-                if len(self.buf) < l:
+            ret = bytearray()
+            while self.buf_offset + 2 <= len(self.buf):
+                l = int.from_bytes(self.buf[self.buf_offset:self.buf_offset+2], 'big')
+                if self.buf_offset + l > len(self.buf):
                     break
-                data = self.buf[2+self.buf[2]:l-4]
-                crc = (-1 - binascii.crc32(self.buf[:l-4])) & 0xffffffff
-                assert int.from_bytes(self.buf[l-4:l], 'little') == crc
-                ret += data
-                del self.buf[:l]
-            return ret
+                rnd_len = self.buf[self.buf_offset+2]
+                data = self.buf[self.buf_offset+2+rnd_len:self.buf_offset+l-4]
+                crc = (-1 - binascii.crc32(self.buf[self.buf_offset:self.buf_offset+l-4])) & 0xffffffff
+                assert int.from_bytes(self.buf[self.buf_offset+l-4:self.buf_offset+l], 'little') == crc
+                ret.extend(data)
+                self.buf_offset += l
+            # Compact buffer only when offset is large
+            if self.buf_offset > 8192:
+                del self.buf[:self.buf_offset]
+                self.buf_offset = 0
+            return bytes(ret)
         def pack(s):
             rnd_data = os.urandom(os.urandom(1)[0] % 16)
             data = bytes([len(rnd_data)+1]) + rnd_data + s
@@ -112,40 +123,45 @@ class Verify_Simple_Plugin(BasePlugin):
             crc = (-1 - binascii.crc32(data)) & 0xffffffff
             return data + crc.to_bytes(4, 'little')
         def encrypt(s):
-            ret = b''
+            ret = bytearray()
             while len(s) > 8100:
-                ret += pack(s[:8100])
+                ret.extend(pack(s[:8100]))
                 s = s[8100:]
             if s:
-                ret += pack(s)
-            return ret
+                ret.extend(pack(s))
+            return bytes(ret)
         cipher.pdecrypt = decrypt
         cipher.pencrypt = encrypt
 
 class Verify_Deflate_Plugin(BasePlugin):
     def add_cipher(self, cipher):
         self.buf = bytearray()
+        self.buf_offset = 0
         def decrypt(s):
             self.buf.extend(s)
-            ret = b''
-            while len(self.buf) >= 2:
-                l = int.from_bytes(self.buf[:2], 'big')
-                if len(self.buf) < l:
+            ret = bytearray()
+            while self.buf_offset + 2 <= len(self.buf):
+                l = int.from_bytes(self.buf[self.buf_offset:self.buf_offset+2], 'big')
+                if self.buf_offset + l > len(self.buf):
                     break
-                ret += zlib.decompress(b'x\x9c' + self.buf[2:l])
-                del self.buf[:l]
-            return ret
+                ret.extend(zlib.decompress(b'x\x9c' + self.buf[self.buf_offset+2:self.buf_offset+l]))
+                self.buf_offset += l
+            # Compact buffer only when offset is large
+            if self.buf_offset > 8192:
+                del self.buf[:self.buf_offset]
+                self.buf_offset = 0
+            return bytes(ret)
         def pack(s):
             packed = zlib.compress(s)
             return len(packed).to_bytes(2, 'big') + packed[2:]
         def encrypt(s):
-            ret = b''
+            ret = bytearray()
             while len(s) > 32700:
-                ret += pack(s[:32700])
+                ret.extend(pack(s[:32700]))
                 s = s[32700:]
             if s:
-                ret += pack(s)
-            return ret
+                ret.extend(pack(s))
+            return bytes(ret)
         cipher.pdecrypt = decrypt
         cipher.pencrypt = encrypt
 
