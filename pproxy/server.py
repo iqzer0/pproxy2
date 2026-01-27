@@ -581,6 +581,7 @@ class ProxyH2(ProxySimple):
     def get_stream(self, conn, writer, stream_id):
         reader = asyncio.StreamReader()
         write_buffer = bytearray()
+        write_offset = [0]  # Use list for mutable closure variable
         write_wait = asyncio.Event()
         write_full = asyncio.Event()
         class StreamWriter():
@@ -608,16 +609,22 @@ class ProxyH2(ProxySimple):
         stream_writer = StreamWriter()
         async def write_job():
             while not stream_writer.closed:
-                while len(write_buffer) > 0:
+                buf_len = len(write_buffer)
+                while write_offset[0] < buf_len:
                     while conn.local_flow_control_window(stream_id) <= 0:
                         write_full.clear()
                         await write_full.wait()
                         if stream_writer.closed:
                             break
-                    chunk_size = min(conn.local_flow_control_window(stream_id), len(write_buffer), conn.max_outbound_frame_size)
-                    conn.send_data(stream_id, write_buffer[:chunk_size])
+                    available = buf_len - write_offset[0]
+                    chunk_size = min(conn.local_flow_control_window(stream_id), available, conn.max_outbound_frame_size)
+                    conn.send_data(stream_id, bytes(write_buffer[write_offset[0]:write_offset[0]+chunk_size]))
                     writer.write(conn.data_to_send())
-                    del write_buffer[:chunk_size]
+                    write_offset[0] += chunk_size
+                # Compact buffer only once after sending all available data
+                if write_offset[0] > 0:
+                    del write_buffer[:write_offset[0]]
+                    write_offset[0] = 0
                 if not stream_writer.closed:
                     write_wait.clear()
                     await write_wait.wait()
