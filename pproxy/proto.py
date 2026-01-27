@@ -37,6 +37,7 @@ def socks_address(reader, n):
            int.from_bytes(reader.read(2), 'big')
 
 class BaseProtocol:
+    __slots__ = ('param',)
     def __init__(self, param):
         self.param = param
     @property
@@ -58,6 +59,7 @@ class BaseProtocol:
         try:
             stat_conn(1)
             pending_bytes = 0
+            chunks = []  # Batch chunks for writelines()
             while not reader.at_eof() and not writer.is_closing():
                 data = await reader.read(65536)
                 if not data:
@@ -65,14 +67,17 @@ class BaseProtocol:
                 if stat_bytes is None:
                     continue
                 stat_bytes(len(data))
-                writer.write(data)
+                chunks.append(data)
                 pending_bytes += len(data)
-                # Batch drain: only flush when buffer is large enough
-                if pending_bytes >= 65536:
+                # Batch write: flush when buffer is large enough
+                if pending_bytes >= 131072:  # 128KB threshold
+                    writer.writelines(chunks)  # Single syscall for multiple chunks
+                    chunks.clear()
                     await writer.drain()
                     pending_bytes = 0
-            # Final drain for any remaining data
-            if pending_bytes > 0:
+            # Final flush for any remaining chunks
+            if chunks:
+                writer.writelines(chunks)
                 await writer.drain()
         except Exception:
             pass
@@ -544,33 +549,40 @@ class WS(BaseProtocol):
         reader.rollback(header)
         return reader == b'GET '
     def patch_ws_stream(self, reader, writer, masked=False):
-        data_len, mask_key, _buffer = None, None, bytearray()
+        data_len, mask_key, _buffer, _offset = None, None, bytearray(), 0
         def feed_data(s, o=reader.feed_data):
-            nonlocal data_len, mask_key
+            nonlocal data_len, mask_key, _offset
             _buffer.extend(s)
+            buflen = len(_buffer)
             while 1:
                 if data_len is None:
-                    if len(_buffer) < 2:
+                    if buflen - _offset < 2:
                         break
-                    required = 2 + (4 if _buffer[1]&128 else 0)
-                    p = _buffer[1] & 127
+                    required = 2 + (4 if _buffer[_offset + 1] & 128 else 0)
+                    p = _buffer[_offset + 1] & 127
                     required += 2 if p == 126 else 4 if p == 127 else 0
-                    if len(_buffer) < required:
+                    if buflen - _offset < required:
                         break
-                    data_len = int.from_bytes(_buffer[2:4], 'big') if p == 126 else int.from_bytes(_buffer[2:6], 'big') if p == 127 else p
-                    mask_key = bytes(_buffer[required-4:required]) if _buffer[1]&128 else None
-                    del _buffer[:required]
+                    data_len = (int.from_bytes(_buffer[_offset+2:_offset+4], 'big') if p == 126
+                               else int.from_bytes(_buffer[_offset+2:_offset+6], 'big') if p == 127
+                               else p)
+                    mask_key = bytes(_buffer[_offset+required-4:_offset+required]) if _buffer[_offset+1] & 128 else None
+                    _offset += required
                 else:
-                    if len(_buffer) < data_len:
+                    if buflen - _offset < data_len:
                         break
-                    data = _buffer[:data_len]
+                    data = _buffer[_offset:_offset+data_len]
                     if mask_key:
                         data = _xor_mask(data, mask_key)
                     else:
                         data = bytes(data)
-                    del _buffer[:data_len]
+                    _offset += data_len
                     data_len = None
                     o(data)
+            # Compact buffer only once after processing all frames
+            if _offset > 0:
+                del _buffer[:_offset]
+                _offset = 0
         reader.feed_data = feed_data
         if reader._buffer:
             reader._buffer, buf = bytearray(), reader._buffer
