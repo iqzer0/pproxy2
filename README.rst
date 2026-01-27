@@ -5,8 +5,8 @@ pproxy2
 
 .. |made-with-python| image:: https://img.shields.io/badge/Made%20with-Python-1f425f.svg
    :target: https://www.python.org/
-.. |PyPI-version| image:: https://badge.fury.io/py/pproxy2.svg
-   :target: https://pypi.python.org/pypi/pproxy2/
+.. |PyPI-version| image:: https://img.shields.io/pypi/v/pproxy2.svg
+   :target: https://pypi.org/project/pproxy2/
 .. |GitHub| image:: https://img.shields.io/github/stars/iqzer0/pproxy2?style=social
    :target: https://github.com/iqzer0/pproxy2
 
