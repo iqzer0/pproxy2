@@ -52,22 +52,35 @@ class AEADCipher(BaseCipher):
     def decrypt(self, s):
         self._buffer.extend(s)
         ret = bytearray()
+        offset = 0  # Use offset tracking instead of O(n) deletion
+        buflen = len(self._buffer)
         try:
             while 1:
                 if self._declen is None:
-                    if len(self._buffer) < 2+self.TAG_LENGTH:
+                    if buflen - offset < 2 + self.TAG_LENGTH:
                         break
-                    self._declen = int.from_bytes(self.decrypt_and_verify(self._buffer[:2], self._buffer[2:2+self.TAG_LENGTH]), 'big')
+                    self._declen = int.from_bytes(
+                        self.decrypt_and_verify(
+                            self._buffer[offset:offset+2],
+                            self._buffer[offset+2:offset+2+self.TAG_LENGTH]
+                        ), 'big')
                     assert self._declen <= self.PACKET_LIMIT
-                    del self._buffer[:2+self.TAG_LENGTH]
+                    offset += 2 + self.TAG_LENGTH
                 else:
-                    if len(self._buffer) < self._declen+self.TAG_LENGTH:
+                    if buflen - offset < self._declen + self.TAG_LENGTH:
                         break
-                    ret.extend(self.decrypt_and_verify(self._buffer[:self._declen], self._buffer[self._declen:self._declen+self.TAG_LENGTH]))
-                    del self._buffer[:self._declen+self.TAG_LENGTH]
+                    ret.extend(self.decrypt_and_verify(
+                        self._buffer[offset:offset+self._declen],
+                        self._buffer[offset+self._declen:offset+self._declen+self.TAG_LENGTH]
+                    ))
+                    offset += self._declen + self.TAG_LENGTH
                     self._declen = None
         except Exception:
             return bytes([0])
+        finally:
+            # Compact buffer only once at the end (single O(n) instead of multiple)
+            if offset > 0:
+                del self._buffer[:offset]
         return bytes(ret)
     def encrypt(self, s):
         ret = bytearray()
@@ -231,17 +244,18 @@ def get_cipher(cipher_key):
     cipher = MAP[cipher_name]
     def apply_cipher(reader, writer, pdecrypt, pdecrypt2, pencrypt, pencrypt2):
         reader_cipher, writer_cipher = cipher(key, ota=ota), cipher(key, ota=ota)
-        reader_cipher._buffer = b''
+        reader_cipher._iv_buffer = bytearray()  # Use bytearray for IV buffering
         def decrypt(s):
             s = pdecrypt2(s)
             if not reader_cipher.iv:
-                s = reader_cipher._buffer + s
-                if len(s) >= reader_cipher.IV_LENGTH:
-                    reader_cipher.setup_iv(s[:reader_cipher.IV_LENGTH])
-                    return pdecrypt(reader_cipher.decrypt(s[reader_cipher.IV_LENGTH:]))
-                else:
-                    reader_cipher._buffer = s
-                    return b''
+                reader_cipher._iv_buffer.extend(s)  # Extend instead of concatenate
+                if len(reader_cipher._iv_buffer) >= reader_cipher.IV_LENGTH:
+                    iv = bytes(reader_cipher._iv_buffer[:reader_cipher.IV_LENGTH])
+                    remaining = bytes(reader_cipher._iv_buffer[reader_cipher.IV_LENGTH:])
+                    reader_cipher._iv_buffer = None  # Release memory
+                    reader_cipher.setup_iv(iv)
+                    return pdecrypt(reader_cipher.decrypt(remaining)) if remaining else b''
+                return b''
             else:
                 return pdecrypt(reader_cipher.decrypt(s))
         if hasattr(reader, 'decrypts'):
