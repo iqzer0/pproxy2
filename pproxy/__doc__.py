@@ -19,6 +19,6 @@ except Exception:
         from pkg_resources import get_distribution
         __version__ = get_distribution('pproxy2').version
     except Exception:
-        __version__ = '2.0.0'
+        __version__ = '2.1.0'
 
 __all__ = ['__version__', '__description__', '__url__', '__original_author__', '__original_url__']
