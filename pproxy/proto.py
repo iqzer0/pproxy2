@@ -1,6 +1,7 @@
 import asyncio, socket, urllib.parse, time, re, base64, hmac, struct, hashlib, io, os
 from . import admin
 HTTP_LINE = re.compile('([^ ]+) +(.+?) +(HTTP/[^ ]+)$')
+HTTP_LINE_BYTES = re.compile(rb'^([^ ]+) +(.+?) +(HTTP/[^ ]+)\r\n')  # Bytes version for fast matching
 packstr = lambda s, n=1: len(s).to_bytes(n, 'big') + s
 
 def netloc_split(loc, default_host=None, default_port=None):
@@ -351,8 +352,9 @@ class HTTP(BaseProtocol):
                 if not data:
                     break
                 # Fast pre-check: only do regex if data starts with HTTP method
-                if len(data) >= 4 and data[:4] in self.HTTP_METHOD_PREFIXES and b'\r\n' in data:
-                    if HTTP_LINE.match(data.split(b'\r\n', 1)[0].decode()):
+                if len(data) >= 4 and data[:4] in self.HTTP_METHOD_PREFIXES:
+                    match = HTTP_LINE_BYTES.match(data)  # Use bytes regex - no decode/split needed
+                    if match:
                         if b'\r\n\r\n' not in data:
                             data += await reader.readuntil(b'\r\n\r\n')
                         lines, data = data.split(b'\r\n\r\n', 1)

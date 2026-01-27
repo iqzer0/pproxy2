@@ -1,4 +1,5 @@
 import time, sys, asyncio, functools
+from collections import deque
 
 b2s = lambda i: f'{i/2**30:.1f}G' if i>=2**30 else f'{i/2**20:.1f}M' if i>=2**20 else f'{i/1024:.1f}K'
 
@@ -30,7 +31,8 @@ def all_stat(stats):
     print('='*70)
 
 async def realtime_stat(stats):
-    history = [(stats[:4], time.perf_counter())]
+    history = deque(maxlen=10)  # Use deque with maxlen for O(1) automatic eviction
+    history.append((stats[:4], time.perf_counter()))
     while True:
         await asyncio.sleep(1)
         history.append((stats[:4], time.perf_counter()))
@@ -38,8 +40,6 @@ async def realtime_stat(stats):
         stat = [b2s((i1[i]-i0[i])/(t1-t0))+'/s' for i in range(4)] + stats[4:]
         sys.stdout.write('DIRECT: {5} ({1},{3})   PROXY: {4} ({0},{2})\x1b[0K\r'.format(*stat))
         sys.stdout.flush()
-        if len(history) >= 10:
-            del history[:1]
 
 def setup(loop, args):
     def verbose(s):
@@ -54,14 +54,20 @@ def setup(loop, args):
     # Cache for modstat results to avoid repeated dict lookups and lambda creation
     _modstat_cache = {}
     def modstat(user, remote_ip, host_name, stats=args.stats):
-        # Create cache key
-        cache_key = (id(user) if isinstance(user, (bytes, bytearray)) else user, remote_ip, host_name)
+        # Create cache key - use bytes(user) for stable key (id() can be reused after GC)
+        cache_key = (bytes(user) if isinstance(user, (bytes, bytearray)) else user, remote_ip, host_name)
         cached = _modstat_cache.get(cache_key)
         if cached is not None:
             return cached
 
         u = user.decode().split(':')[0]+':' if isinstance(user, (bytes,bytearray)) else ''
-        host_name_2 = '.'.join(host_name.split('.')[-3 if host_name.endswith('.com.cn') else -2:]) if host_name.split('.')[-1].isalpha() else host_name
+        # Avoid repeated host_name.split('.') call
+        parts = host_name.split('.')
+        if parts[-1].isalpha():
+            suffix_len = 3 if host_name.endswith('.com.cn') else 2
+            host_name_2 = '.'.join(parts[-suffix_len:])
+        else:
+            host_name_2 = host_name
         tostat = (stats[0], stats.setdefault(u+remote_ip, {}).setdefault(host_name_2, [0]*6))
 
         # Pre-create stat update functions for each index
