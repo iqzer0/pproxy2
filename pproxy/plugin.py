@@ -75,8 +75,8 @@ class Tls1__2_Ticket_Auth_Plugin(BasePlugin):
                 assert header == b'\x17\x03\x03'
                 ret.extend(self.buf[self.buf_offset+5:self.buf_offset+5+l])
                 self.buf_offset += 5 + l
-            # Compact buffer only when offset is large to reduce reallocations
-            if self.buf_offset > 8192:
+            # Always compact buffer after processing to prevent unbounded growth
+            if self.buf_offset > 0:
                 del self.buf[:self.buf_offset]
                 self.buf_offset = 0
             return bytes(ret)
@@ -111,8 +111,8 @@ class Verify_Simple_Plugin(BasePlugin):
                 assert int.from_bytes(self.buf[self.buf_offset+l-4:self.buf_offset+l], 'little') == crc
                 ret.extend(data)
                 self.buf_offset += l
-            # Compact buffer only when offset is large
-            if self.buf_offset > 8192:
+            # Always compact buffer after processing to prevent unbounded growth
+            if self.buf_offset > 0:
                 del self.buf[:self.buf_offset]
                 self.buf_offset = 0
             return bytes(ret)
@@ -146,8 +146,8 @@ class Verify_Deflate_Plugin(BasePlugin):
                     break
                 ret.extend(zlib.decompress(b'x\x9c' + self.buf[self.buf_offset+2:self.buf_offset+l]))
                 self.buf_offset += l
-            # Compact buffer only when offset is large
-            if self.buf_offset > 8192:
+            # Always compact buffer after processing to prevent unbounded growth
+            if self.buf_offset > 0:
                 del self.buf[:self.buf_offset]
                 self.buf_offset = 0
             return bytes(ret)

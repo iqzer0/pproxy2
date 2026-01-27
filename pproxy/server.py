@@ -14,16 +14,26 @@ class ConnectionPool:
     """
     Async connection pool for reusing TCP connections.
     Pools connections by (host, port) key to avoid TCP handshake overhead.
+    Uses per-host locks to reduce contention under high concurrency.
     """
     def __init__(self, max_per_host=5, max_idle_time=30, max_total=100):
         self._pools = {}  # (host, port) -> deque of (reader, writer, timestamp)
+        self._locks = {}  # Per-host locks to reduce contention
         self._max_per_host = max_per_host
         self._max_idle_time = max_idle_time
         self._max_total = max_total
         self._total_count = 0
-        self._lock = asyncio.Lock()
+        self._global_lock = asyncio.Lock()  # Only for creating new pools/locks
         self._cleanup_task = None
         self._stats = {'hits': 0, 'misses': 0, 'created': 0, 'reused': 0}
+
+    async def _get_lock(self, key):
+        """Get or create a per-host lock."""
+        if key not in self._locks:
+            async with self._global_lock:
+                if key not in self._locks:
+                    self._locks[key] = asyncio.Lock()
+        return self._locks[key]
 
     def _start_cleanup(self):
         """Start background cleanup task if not running."""
@@ -43,9 +53,16 @@ class ConnectionPool:
     async def _cleanup_stale(self):
         """Remove connections that have been idle too long."""
         now = time.monotonic()
-        async with self._lock:
-            for key in list(self._pools.keys()):
-                pool = self._pools[key]
+        # Get list of keys under global lock
+        async with self._global_lock:
+            keys = list(self._pools.keys())
+
+        for key in keys:
+            lock = await self._get_lock(key)
+            async with lock:
+                pool = self._pools.get(key)
+                if not pool:
+                    continue
                 # Remove stale connections from the front (oldest)
                 while pool:
                     reader, writer, timestamp = pool[0]
@@ -60,7 +77,9 @@ class ConnectionPool:
                         break
                 # Remove empty pools
                 if not pool:
-                    del self._pools[key]
+                    async with self._global_lock:
+                        if key in self._pools and not self._pools[key]:
+                            del self._pools[key]
 
     async def get(self, host, port):
         """
@@ -68,7 +87,13 @@ class ConnectionPool:
         Returns (reader, writer) if available, None otherwise.
         """
         key = (host, port)
-        async with self._lock:
+        # Quick check without lock
+        if key not in self._pools:
+            self._stats['misses'] += 1
+            return None
+
+        lock = await self._get_lock(key)
+        async with lock:
             pool = self._pools.get(key)
             if not pool:
                 self._stats['misses'] += 1
@@ -115,9 +140,18 @@ class ConnectionPool:
                 pass
             return False
 
+        # Quick check for total pool size (atomic read, no lock needed)
+        if self._total_count >= self._max_total:
+            try:
+                writer.close()
+            except Exception:
+                pass
+            return False
+
         key = (host, port)
-        async with self._lock:
-            # Check total pool size
+        lock = await self._get_lock(key)
+        async with lock:
+            # Re-check total under lock
             if self._total_count >= self._max_total:
                 try:
                     writer.close()
@@ -127,8 +161,11 @@ class ConnectionPool:
 
             pool = self._pools.get(key)
             if pool is None:
-                pool = self._pools[key] = deque()
-                self._start_cleanup()
+                async with self._global_lock:
+                    pool = self._pools.get(key)
+                    if pool is None:
+                        pool = self._pools[key] = deque()
+                        self._start_cleanup()
 
             # Check per-host limit
             if len(pool) >= self._max_per_host:
@@ -193,28 +230,26 @@ patch_StreamReader()
 patch_StreamWriter()
 
 class AuthTable(object):
-    _auth = OrderedDict()
-    _user = OrderedDict()
+    _auth = OrderedDict()  # {remote_ip: (timestamp, user)}
     MAX_ENTRIES = 10000  # Prevent unbounded memory growth
     def __init__(self, remote_ip, authtime):
         self.remote_ip = remote_ip
         self.authtime = authtime
     def authed(self):
-        if time.time() - self._auth.get(self.remote_ip, 0) <= self.authtime:
-            # Move to end (most recently used)
-            if self.remote_ip in self._auth:
+        entry = self._auth.get(self.remote_ip)
+        if entry is not None:
+            timestamp, user = entry
+            if time.monotonic() - timestamp <= self.authtime:
+                # Move to end (most recently used)
                 self._auth.move_to_end(self.remote_ip)
-                self._user.move_to_end(self.remote_ip)
-            return self._user.get(self.remote_ip)
+                return user
+        return None
     def set_authed(self, user):
         # Evict oldest entries if at capacity
         while len(self._auth) >= self.MAX_ENTRIES:
             self._auth.popitem(last=False)
-            self._user.popitem(last=False)
-        self._auth[self.remote_ip] = time.time()
-        self._user[self.remote_ip] = user
+        self._auth[self.remote_ip] = (time.monotonic(), user)
         self._auth.move_to_end(self.remote_ip)
-        self._user.move_to_end(self.remote_ip)
 
 async def prepare_ciphers(cipher, reader, writer, bind=None, server_side=True):
     if cipher:
@@ -231,10 +266,13 @@ async def prepare_ciphers(cipher, reader, writer, bind=None, server_side=True):
 
 _rr_index = [0]  # Mutable container for round-robin state
 
+def _server_matches(server, host_name, port):
+    """Check if server is alive and matches the host/port rule."""
+    return server.alive and server.match_rule(host_name, port)
+
 def schedule(rserver, salgorithm, host_name, port):
-    filter_cond = lambda o: o.alive and o.match_rule(host_name, port)
     if salgorithm == 'fa':
-        return next(filter(filter_cond, rserver), None)
+        return next((o for o in rserver if _server_matches(o, host_name, port)), None)
     elif salgorithm == 'rr':
         # O(1) index-based round-robin instead of O(n) list modification
         n = len(rserver)
@@ -244,15 +282,15 @@ def schedule(rserver, salgorithm, host_name, port):
         for offset in range(n):
             i = (start + offset) % n
             roption = rserver[i]
-            if filter_cond(roption):
+            if _server_matches(roption, host_name, port):
                 _rr_index[0] = i + 1  # Next call starts from next server
                 return roption
         return None
     elif salgorithm == 'rc':
-        filters = [i for i in rserver if filter_cond(i)]
+        filters = [i for i in rserver if _server_matches(i, host_name, port)]
         return random.choice(filters) if filters else None
     elif salgorithm == 'lc':
-        return min(filter(filter_cond, rserver), default=None, key=lambda i: i.connections)
+        return min((o for o in rserver if _server_matches(o, host_name, port)), default=None, key=lambda i: i.connections)
     else:
         raise Exception('Unknown scheduling algorithm') #Unreachable
 
