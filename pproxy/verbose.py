@@ -91,7 +91,10 @@ def setup(loop, args):
     if args.v >= 2:
         asyncio.ensure_future(realtime_stat(args.stats[0]))
         if sys.platform != 'win32':
-            loop.add_reader(sys.stdin, functools.partial(all_stat_other, args.stats))
+            try:
+                loop.add_reader(sys.stdin, functools.partial(all_stat_other, args.stats))
+            except (PermissionError, OSError):
+                pass  # Ignore if stdin is not a real file descriptor
         else:
             loop.run_in_executor(None, win_readline, functools.partial(all_stat, args.stats))
 
