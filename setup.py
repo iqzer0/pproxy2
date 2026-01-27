@@ -14,7 +14,7 @@ def find_value(name):
 
 setup(
     name                = find_value('title'),
-    version             = '2.2.0',
+    version             = '2.3.0',
     description         = find_value('description'),
     long_description    = read('README.rst'),
     long_description_content_type = 'text/x-rst',
