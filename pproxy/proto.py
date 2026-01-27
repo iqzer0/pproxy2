@@ -58,26 +58,13 @@ class BaseProtocol:
     async def channel(self, reader, writer, stat_bytes, stat_conn):
         try:
             stat_conn(1)
-            pending_bytes = 0
-            chunks = []  # Batch chunks for writelines()
             while not reader.at_eof() and not writer.is_closing():
                 data = await reader.read(65536)
                 if not data:
                     break
-                if stat_bytes is None:
-                    continue
-                stat_bytes(len(data))
-                chunks.append(data)
-                pending_bytes += len(data)
-                # Batch write: flush when buffer is large enough
-                if pending_bytes >= 131072:  # 128KB threshold
-                    writer.writelines(chunks)  # Single syscall for multiple chunks
-                    chunks.clear()
-                    await writer.drain()
-                    pending_bytes = 0
-            # Final flush for any remaining chunks
-            if chunks:
-                writer.writelines(chunks)
+                if stat_bytes is not None:
+                    stat_bytes(len(data))
+                writer.write(data)
                 await writer.drain()
         except Exception:
             pass
