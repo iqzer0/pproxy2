@@ -137,6 +137,15 @@ Proxy chain (forward to upstream):
 
   $ pproxy2 -l http+socks5://:8080 -r socks5://upstream:1080
 
+Proxy chain with upstream authentication:
+
+.. code:: rst
+
+  $ pproxy2 -l http+socks5://:8080 -r "socks5://upstream:1080#user:password"
+
+Note: Authentication uses ``#user:password`` suffix (not ``user:password@host``).
+Use quotes to prevent shell interpretation of ``#``.
+
 Features
 --------
 
