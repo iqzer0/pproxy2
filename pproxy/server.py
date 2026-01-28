@@ -1268,7 +1268,10 @@ def print_server_started(option, server, print_fn):
         f = str(s.family)
         ipversion = "ipv4" if f == "AddressFamily.AF_INET" else ("ipv6" if f == "AddressFamily.AF_INET6" else "ipv?") # TODO better
         bind = ipversion+' '+h+':'+str(p)
-        print_fn(option, bind)
+        try:
+            print_fn(option, bind)
+        except BlockingIOError:
+            pass  # Ignore when stdout is blocked (e.g., multiple workers)
 
 def main(args = None):
     origin_argv = sys.argv[1:] if args is None else args
@@ -1324,10 +1327,16 @@ def main(args = None):
         except ModuleNotFoundError:
             print("Missing library: pip3 install python-daemon")
             return
+    # Helper to safely print (ignores BlockingIOError from multi-worker stdout contention)
+    def safe_print(*args, **kwargs):
+        try:
+            print(*args, **kwargs)
+        except BlockingIOError:
+            pass
     # Multi-process worker support (requires SO_REUSEPORT)
     if args.workers > 1:
         if sys.platform == 'win32':
-            print('Multi-process workers not supported on Windows')
+            safe_print('Multi-process workers not supported on Windows')
             return
         # Auto-enable SO_REUSEPORT for multi-process
         args.ruport = True
@@ -1337,7 +1346,7 @@ def main(args = None):
             pid = os.fork()
             if pid == 0:
                 # Child process - continue to run proxy
-                print(f'Worker {i+1} started (PID: {os.getpid()})')
+                safe_print(f'Worker {i+1} started (PID: {os.getpid()})')
                 break
             else:
                 # Parent process - track child
@@ -1345,16 +1354,16 @@ def main(args = None):
         else:
             # Parent process after forking all children
             if worker_pids:
-                print(f'Master process (PID: {os.getpid()}) with {len(worker_pids)} workers')
+                safe_print(f'Master process (PID: {os.getpid()}) with {len(worker_pids)} workers')
                 # Parent also runs as a worker
     # Try to use uvloop instead of the default event loop (2-3x faster for connections)
     try:
         import uvloop
         loop = uvloop.new_event_loop()
         asyncio.set_event_loop(loop)
-        print('Using uvloop (faster event loop)')
+        safe_print('Using uvloop (faster event loop)')
     except (ModuleNotFoundError, PermissionError, OSError):
-        print('Tip: Install uvloop for 2-3x faster connection handling: pip install uvloop')
+        safe_print('Tip: Install uvloop for 2-3x faster connection handling: pip install uvloop')
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
     if args.v:
@@ -1363,36 +1372,36 @@ def main(args = None):
     servers = []
     admin.config.update({'argv': origin_argv, 'servers': servers, 'args': args, 'loop': loop})
     def print_fn(option, bind=None):
-        print('Serving on', (bind or option.bind), 'by', ",".join(i.name for i in option.protos) + ('(SSL)' if option.sslclient else ''), '({}{})'.format(option.cipher.name, ' '+','.join(i.name() for i in option.cipher.plugins) if option.cipher and option.cipher.plugins else '') if option.cipher else '')
+        safe_print('Serving on', (bind or option.bind), 'by', ",".join(i.name for i in option.protos) + ('(SSL)' if option.sslclient else ''), '({}{})'.format(option.cipher.name, ' '+','.join(i.name() for i in option.cipher.plugins) if option.cipher and option.cipher.plugins else '') if option.cipher else '')
     for option in args.listen:
         try:
             server = loop.run_until_complete(option.start_server(vars(args)))
-            print_server_started(option, server, print_fn)
             servers.append(server)
+            print_server_started(option, server, print_fn)
         except Exception as ex:
             print_fn(option)
-            print('Start server failed.\n\t==>', ex)
+            safe_print('Start server failed.\n\t==>', ex)
     def print_fn(option, bind=None):
-        print('Serving on UDP', (bind or option.bind), 'by', ",".join(i.name for i in option.protos), f'({option.cipher.name})' if option.cipher else '')
+        safe_print('Serving on UDP', (bind or option.bind), 'by', ",".join(i.name for i in option.protos), f'({option.cipher.name})' if option.cipher else '')
     for option in args.ulisten:
         try:
             server, protocol = loop.run_until_complete(option.udp_start_server(vars(args)))
-            print_server_started(option, server, print_fn)
             servers.append(server)
+            print_server_started(option, server, print_fn)
         except Exception as ex:
             print_fn(option)
-            print('Start server failed.\n\t==>', ex)
+            safe_print('Start server failed.\n\t==>', ex)
     def print_fn(option, bind=None):
-        print('Serving on', (bind or option.bind), 'backward by', ",".join(i.name for i in option.protos) + ('(SSL)' if option.sslclient else ''), '({}{})'.format(option.cipher.name, ' '+','.join(i.name() for i in option.cipher.plugins) if option.cipher and option.cipher.plugins else '') if option.cipher else '')
+        safe_print('Serving on', (bind or option.bind), 'backward by', ",".join(i.name for i in option.protos) + ('(SSL)' if option.sslclient else ''), '({}{})'.format(option.cipher.name, ' '+','.join(i.name() for i in option.cipher.plugins) if option.cipher and option.cipher.plugins else '') if option.cipher else '')
     for option in args.rserver:
         if isinstance(option, ProxyBackward):
             try:
                 server = loop.run_until_complete(option.start_backward_client(vars(args)))
-                print_server_started(option, server, print_fn)
                 servers.append(server)
+                print_server_started(option, server, print_fn)
             except Exception as ex:
                 print_fn(option)
-                print('Start server failed.\n\t==>', ex)
+                safe_print('Start server failed.\n\t==>', ex)
     if servers:
         if args.sys:
             from . import sysproxy
@@ -1402,7 +1411,7 @@ def main(args = None):
         try:
             loop.run_forever()
         except KeyboardInterrupt:
-            print('exit')
+            safe_print('exit')
         if args.sys:
             args.sys.clear()
     for task in asyncio.all_tasks(loop) if hasattr(asyncio, 'all_tasks') else asyncio.Task.all_tasks():
