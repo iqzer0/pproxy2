@@ -313,11 +313,11 @@ async def http_keepalive_proxy(reader, writer, reader_remote, writer_remote,
 
     response_tracker = proto.HTTPResponseTracker()
     can_pool = True
-    last_response_complete = False  # Track if last response was complete
+    requests_started = 0  # count of complete client requests forwarded to remote
 
     async def forward_to_remote():
         """Forward requests from client to remote."""
-        nonlocal can_pool
+        nonlocal can_pool, requests_started
         pending_bytes = 0
         try:
             while not reader.at_eof() and not writer_remote.is_closing():
@@ -328,19 +328,29 @@ async def http_keepalive_proxy(reader, writer, reader_remote, writer_remote,
                 if len(data) >= 4 and data[:4] in lproto.HTTP_METHOD_PREFIXES:
                     match = proto.HTTP_LINE_BYTES.match(data)
                     if match:
-                        if b'\r\n\r\n' not in data:
+                        # The \r\n\r\n terminator may straddle read boundaries, so keep
+                        # reading and search the ACCUMULATED buffer. (readuntil scans only
+                        # newly-arrived bytes and would miss a split terminator, stalling.)
+                        while b'\r\n\r\n' not in data:
                             try:
-                                data += await reader.readuntil(b'\r\n\r\n')
-                            except asyncio.IncompleteReadError:
+                                more = await reader.read(65536)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                more = b''
+                            if not more:
                                 break
-                        lines, body = data.split(b'\r\n\r\n', 1)
-                        headers = lines.decode().split('\r\n')
-                        method, path, ver = proto.HTTP_LINE.match(headers.pop(0)).groups()
-                        # Remove Proxy- headers
-                        headers = [h for h in headers if not h.startswith('Proxy-')]
-                        newpath = urllib.parse.urlparse(path)._replace(netloc='', scheme='').geturl()
-                        data = f'{method} {newpath} {ver}\r\n' + '\r\n'.join(headers) + '\r\n\r\n'
-                        data = data.encode() + body
+                            data += more
+                        if b'\r\n\r\n' in data:
+                            requests_started += 1
+                            lines, body = data.split(b'\r\n\r\n', 1)
+                            headers = lines.decode().split('\r\n')
+                            method, path, ver = proto.HTTP_LINE.match(headers.pop(0)).groups()
+                            # Remove Proxy- headers
+                            headers = [h for h in headers if not h.startswith('Proxy-')]
+                            newpath = urllib.parse.urlparse(path)._replace(netloc='', scheme='').geturl()
+                            data = f'{method} {newpath} {ver}\r\n' + '\r\n'.join(headers) + '\r\n\r\n'
+                            data = data.encode() + body
 
                 stat_bytes_to_remote(len(data))
                 writer_remote.write(data)
@@ -357,28 +367,18 @@ async def http_keepalive_proxy(reader, writer, reader_remote, writer_remote,
 
     async def forward_from_remote():
         """Forward responses from remote to client, tracking completion."""
-        nonlocal can_pool, response_tracker, last_response_complete
+        nonlocal can_pool
         try:
             while not reader_remote.at_eof() and not writer.is_closing():
                 data = await reader_remote.read(65536)
                 if not data:
                     break
-
-                # Feed data to tracker to detect response completion
-                data, is_complete = response_tracker.feed(data)
-                if data:
-                    stat_bytes_from_remote(len(data))
-                    writer.write(data)
-                    await writer.drain()
-
-                if is_complete:
-                    # Response complete - mark it
-                    last_response_complete = True
-                    # Check if we can keep the connection
-                    if not response_tracker.can_reuse():
-                        can_pool = False
-                    # Reset tracker for next response
-                    response_tracker = proto.HTTPResponseTracker()
+                # Track response framing for the reuse decision; forward bytes unchanged
+                # (the tracker never re-emits data, so the stream can't be corrupted).
+                response_tracker.feed(data)
+                stat_bytes_from_remote(len(data))
+                writer.write(data)
+                await writer.drain()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -415,14 +415,21 @@ async def http_keepalive_proxy(reader, writer, reader_remote, writer_remote,
         except Exception:
             pass
 
-        # Try to return remote connection to pool
-        if can_pool and last_response_complete:
-            # Check if remote connection is still healthy
-            if not writer_remote.is_closing() and not reader_remote.at_eof():
-                pooled = await CONNECTION_POOL.put(host, port, reader_remote, writer_remote)
-                if pooled:
-                    CONNECTION_POOL._stats['reused'] += 1
-                    return  # Connection is in pool, don't close
+        # Return the remote connection to the pool only when it is provably safe:
+        #  - no transport error occurred (can_pool)
+        #  - every request we forwarded got a complete response, so nothing is still
+        #    in flight on the socket (requests_started == responses_completed). This is
+        #    what prevents pooling a connection whose response is still arriving after
+        #    the client disconnected mid-request.
+        #  - the tracker sits at a clean response boundary and keep-alive is set
+        #  - the socket is still healthy
+        if (can_pool and requests_started > 0
+                and requests_started == response_tracker.responses_completed
+                and response_tracker.can_reuse()
+                and not writer_remote.is_closing() and not reader_remote.at_eof()):
+            pooled = await CONNECTION_POOL.put(host, port, reader_remote, writer_remote)
+            if pooled:
+                return  # Connection is in pool, don't close
 
         # Close remote connection if not pooled
         try:

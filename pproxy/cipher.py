@@ -79,7 +79,10 @@ class AEADCipher(BaseCipher):
     @property
     def nonce(self):
         ret = self._nonce.to_bytes(self.NONCE_LENGTH, 'little')
-        self._nonce = (self._nonce+1) & ((1<<self.NONCE_LENGTH)-1)
+        # NONCE_LENGTH is a byte count; the counter must wrap at 2**(bits), not 2**(bytes).
+        # The old mask (1<<NONCE_LENGTH) wrapped at 4096, causing nonce reuse and
+        # desync with spec-compliant shadowsocks peers after ~33 MB.
+        self._nonce = (self._nonce+1) & ((1<<(self.NONCE_LENGTH*8))-1)
         return ret
     def decrypt(self, s):
         self._buffer.extend(s)
@@ -276,7 +279,10 @@ def get_cipher(cipher_key):
         reader_cipher._iv_buffer = bytearray()  # Use bytearray for IV buffering
         def decrypt(s):
             s = pdecrypt2(s)
-            if not reader_cipher.iv:
+            # Use `is None` (not truthiness): zero-IV ciphers (e.g. rc4) have iv == b''
+            # after setup, which is falsy and would re-enter this branch and crash on
+            # the (now None) _iv_buffer.
+            if reader_cipher.iv is None:
                 reader_cipher._iv_buffer.extend(s)  # Extend instead of concatenate
                 if len(reader_cipher._iv_buffer) >= reader_cipher.IV_LENGTH:
                     iv = bytes(reader_cipher._iv_buffer[:reader_cipher.IV_LENGTH])
@@ -302,7 +308,7 @@ def get_cipher(cipher_key):
                 reader._buffer, buf = bytearray(), reader._buffer
                 feed_data(buf)
         def write(s, o=writer.write):
-            if not writer_cipher.iv:
+            if writer_cipher.iv is None:
                 writer_cipher.setup_iv()
                 o(pencrypt2(writer_cipher.iv))
             if not s:
