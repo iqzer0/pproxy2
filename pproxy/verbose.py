@@ -8,27 +8,30 @@ def all_stat_other(stats):
     all_stat(stats)
 
 def all_stat(stats):
-    if len(stats) <= 1:
-        print('no traffic')
-        return
-    print('='*70)
-    hstat = {}
-    for remote_ip, v in stats.items():
-        if remote_ip == 0: continue
-        stat = [0]*6
-        for host_name, v2 in v.items():
-            for h in (stat, hstat.setdefault(host_name, [0]*6)):
-                for i in range(6):
-                    h[i] += v2[i]
-        stat = [b2s(i) for i in stat[:4]] + stat[4:]
-        print(remote_ip, '\tDIRECT: {5} ({1},{3})  PROXY: {4} ({0},{2})'.format(*stat))
-    print(' '*3+'-'*64)
-    hstat = sorted(hstat.items(), key=lambda x: sum(x[1]), reverse=True)[:15]
-    hlen = max(map(lambda x: len(x[0]), hstat)) if hstat else 0
-    for host_name, stat in hstat:
-        stat, conn = (b2s(stat[0]+stat[1]), b2s(stat[2]+stat[3])), stat[4]+stat[5]
-        print(host_name.ljust(hlen+5), '{0} / {1}'.format(*stat), '/ {}'.format(conn) if conn else '')
-    print('='*70)
+    try:
+        if len(stats) <= 1:
+            print('no traffic')
+            return
+        print('='*70)
+        hstat = {}
+        for remote_ip, v in stats.items():
+            if remote_ip == 0: continue
+            stat = [0]*6
+            for host_name, v2 in v.items():
+                for h in (stat, hstat.setdefault(host_name, [0]*6)):
+                    for i in range(6):
+                        h[i] += v2[i]
+            stat = [b2s(i) for i in stat[:4]] + stat[4:]
+            print(remote_ip, '\tDIRECT: {5} ({1},{3})  PROXY: {4} ({0},{2})'.format(*stat))
+        print(' '*3+'-'*64)
+        hstat = sorted(hstat.items(), key=lambda x: sum(x[1]), reverse=True)[:15]
+        hlen = max(map(lambda x: len(x[0]), hstat)) if hstat else 0
+        for host_name, stat in hstat:
+            stat, conn = (b2s(stat[0]+stat[1]), b2s(stat[2]+stat[3])), stat[4]+stat[5]
+            print(host_name.ljust(hlen+5), '{0} / {1}'.format(*stat), '/ {}'.format(conn) if conn else '')
+        print('='*70)
+    except BlockingIOError:
+        pass  # Ignore when stdout is blocked (e.g., multiple workers)
 
 async def realtime_stat(stats):
     history = deque(maxlen=10)  # Use deque with maxlen for O(1) automatic eviction
@@ -38,17 +41,23 @@ async def realtime_stat(stats):
         history.append((stats[:4], time.perf_counter()))
         i0, t0, i1, t1 = history[0][0], history[0][1], history[-1][0], history[-1][1]
         stat = [b2s((i1[i]-i0[i])/(t1-t0))+'/s' for i in range(4)] + stats[4:]
-        sys.stdout.write('DIRECT: {5} ({1},{3})   PROXY: {4} ({0},{2})\x1b[0K\r'.format(*stat))
-        sys.stdout.flush()
+        try:
+            sys.stdout.write('DIRECT: {5} ({1},{3})   PROXY: {4} ({0},{2})\x1b[0K\r'.format(*stat))
+            sys.stdout.flush()
+        except BlockingIOError:
+            pass  # Ignore when stdout is blocked (e.g., multiple workers)
 
 def setup(loop, args):
     def verbose(s):
-        if args.v >= 2:
-            sys.stdout.write('\x1b[32m'+time.strftime('%Y-%m-%d %H:%M:%S')+'\x1b[m ')
-            sys.stdout.write(s+'\x1b[0K\n')
-        else:
-            sys.stdout.write(s+'\n')
-        sys.stdout.flush()
+        try:
+            if args.v >= 2:
+                sys.stdout.write('\x1b[32m'+time.strftime('%Y-%m-%d %H:%M:%S')+'\x1b[m ')
+                sys.stdout.write(s+'\x1b[0K\n')
+            else:
+                sys.stdout.write(s+'\n')
+            sys.stdout.flush()
+        except BlockingIOError:
+            pass  # Ignore when stdout is blocked (e.g., multiple workers)
     args.verbose = verbose
     args.stats = {0: [0]*6}
     # Cache for modstat results to avoid repeated dict lookups and lambda creation
